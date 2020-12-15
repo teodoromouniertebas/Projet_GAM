@@ -1,0 +1,426 @@
+---
+title: "Prévisions du Baltic Dry Index et méthodes de sélection de variables"
+author: "Diane THIERRY et Teodoro MOUNIER TEBAS"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    theme: paper
+    highlight: textmate
+    toc: yes
+    toc_float: yes
+---
+<style>
+body {
+text-align: justify}
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, message = FALSE, warning = FALSE,
+#fig.width = 7, fig.height = 7,
+#out.width = 7, out.height = 7,
+#collapse = TRUE,  fig.show = "hold", out.width = "75%", fig.align = "center")
+collapse = TRUE,  fig.show = "hold",
+out.width = "75%")
+```
+
+
+```{r include=FALSE}
+ # Library #
+library(readxl)
+library(tidyverse)
+library(lgarch)
+library(gets)
+library(glmnet)
+library(rbridge)
+library(doParallel)
+registerDoParallel(cores=4)
+library(ggplot2)
+library(purrr)
+library(tseries)
+library(forecast)
+library(dplyr)
+library(gridExtra)
+library(dyn)
+library(ncvreg)
+library(car)
+```
+
+## Sommaire
+
+ * Introduction
+ * Analyses exploratoire et descriptive
+ * Sélection des variables
+ * Modèle de regression
+ * Conclusion
+ * Annexes
+ 
+ 
+ 
+------------------------------------------------------------------------------
+# Introduction
+------------------------------------------------------------------------------
+
+La grande quantité d'informations créées et collectées chaque jour présente de nombreux avantages d'un point de vu statistique et analytique, mais peut parfois être un inconvénient dans le sens où toutes les données ne sont pas pertinentes dans l'étude d'un phénomène. Le développement des données massives (Big Data), a donc été accompagné par l'essort de nouvelles méthodes de sélection de variables qui visent à identifier les informations pertinentes de celles redondantes ou inutiles. En effet, un modèle est considéré comme explicite, interprétable lorsqu'il est parcimonieux et contient 4-5 variables qui pourront alors être interprétées librement. 
+
+La quantité de méthodes de sélection de variables est elle aussi importante, et l'objectif de ce dossier est d'en experimenter certaines dans le but d'appliquer une modélisation par les Moindres Carrés Ordinaires (MCO), la plus parcimonieuse possible. Notre objectif est d'expliquer le cours du Baltic Dry Index (BDI) entre février 2007 et décembre 2018, avec des données mensuelles. Le BDI est un indice couvrant le coût du fret maritime ; il fournit pour cela une évaluation du prix à payer pour transporter par voie du mer différentes matières premières spécifiques telles que le charbon, les céréales ou les minerais. 
+
+Outre ce premier objectif, nous chercherons à automatiser toute notre analyse pour que celle-ci s'ajourne à chaque ouverture du rapport Rmarkdown. 
+
+
+
+
+
+
+
+
+------------------------------------------------------------------------------
+# Analyses exploratoire et descriptive
+------------------------------------------------------------------------------
+
+Commencons dans une permière partie par explorer nos données pour les comprendre puis appliquer certaines modifications pour les rendre exploitables pour la suite de l'analyse. 
+
+## Importation de la base et premières manipulations (peut etre enlever titre sous-partie)
+
+
+```{r echo=TRUE}
+# Import des données
+library(readxl)
+df_fret <- read_excel("database project fret.xlsx")
+df_fret <- data.frame(df_fret)
+```
+
+```{r include=FALSE}
+    #manips de base
+#summary(df_fret)
+#dim(df_fret) #153
+df_fret <- na.omit(df_fret)
+#dim(df_fret) #144
+#str(df_fret)
+df_fret$Date <- as.Date(df_fret$Date)
+#str(df_fret)
+#summary(df_fret)
+#names(df_fret)
+```
+
+Ainsi, importée notre base contient `nrow(df_fret)` lignes et `ncol(df_fret)` colonnes dont une de temps avec les dates, une de la variable à expliquer et `ncol(df_fret)-2` variables explicatives. De manière à rendre la base exploitable pour l'analyse nous retirons les `na.count(df_fret)` (ne focntionne pas, à trouvrer) valeurs manquantes, et nous mettons le bon format à la variable de temps. 
+
+
+## Analyse de la stationnarité (Tableau avec la transformation des données)
+
+Nous analysons à présent la stationnarité des variables puisque celle-ci est nécéssaire pour l'application des futures méthodes : elle implique que la série soit indépendante du temps, c'est à dire avec une même espérance mathématique et une même variance pour chaque observation. Nous utiliserons le test *Augmented Dickey-Fuller* (ADF) qui est suit la règle de décision suivante :
++ H^(_0) : existance d'une racine unitaire, la série n'est pas stationnaire
++ H^(_1) : la série est stationnaire
+
+```{r echo=TRUE}
+# on met en série temporelle
+library(tseries)
+ts_fret <- ts(data = df_fret[,2:29], start=c(2007,01,01),frequency=12)
+
+# Test ADF de la racine unitaire : H0=pas stationnaire
+pvalue <- 0
+for (i in 1:ncol(ts_fret)){
+  pvalue[i] <- adf.test(ts_fret[,i])$p.value }
+test_ADF <- as.data.frame(pvalue)
+
+resultat <- 0   # Oui stationnaire
+for (i in 1:nrow(test_ADF)){
+  if (test_ADF[i,"pvalue"]<0.05)
+    resultat[i] <- "Oui"
+  else
+    resultat[i] <- "Non"
+}
+test_ADF <- cbind(test_ADF,resultat)  # pq pas trouver boucle qui colore en rouge les lignes non statio
+rownames(test_ADF) <- paste(colnames(ts_fret))
+
+# On affiche les résultats du test
+test_ADF <- data.frame(test_ADF)
+DT::datatable(test_ADF)
+```
+
+Par la sortie du test on voit que seules `length(test_ADF$resultat[test_ADF$resultat=="Oui"])` variables sont considérées stationnaires sur `length(test_ADF)`. Cependant, comme visible sur le grahique ci-dessous, malgré le fait que le test ADF considère la variable comme stationnaire, nous voyons que ses fluctuations ne sont pas indépendantes du temps. Par précaution nous deçidons donc de stationnariser toutes les variables de notre base via une fonction *lag* qui différencie une fois toutes les variables (excepté la date) :
+
+```{r echo=FALSE, eval=TRUE}
+library(plotly)
+plot_ly(data=df_fret, x = ~Date , y = ~Container.Index, mode = 'lines')
+```
+
+```{r echo=TRUE}
+# différenciation en passant par le lag
+df_fret[,2:29] <- df_fret[,2:29] %>% mutate(df_fret[,2:29] - lag(df_fret[,2:29]))
+df_fret <- na.omit(df_fret)
+```
+
+
+## Analyse des outliers
+
+Nous continuons notre démarche de manipulations des données dans le but de les rendre exploitables, en identifiant et retirant les observations atypiques de la base. Certaines valeurs sont effectivement considérées comme atypique, aberrante par leur forte ou très faible valeur : il est important de les déceler car elles peuvent biaiser l'analyse. La moyenne et la médiane en sont de bons exemples ; une forte valeur va tirer la moyenne vers le haut tandis que la vraie valeur pour laquelle 50% de l'échantillon a plus et 50% a moins, sera plus faible car non influencée par ces outliers. En séries temporelles, ces derniers sont le plus souvent liés à des chocs exogènes tels que guerres, crises, ou encore changements politiques. 
+
+Selon la nature de la variable à laquelle on souhaite retirer les points atypiques, la méthode diffère : nous distinguons donc 2 méthodes, une pour les indices financiers et une autre pour les variables temporelles non financières. 
+
+### Sur les variables étant des indices
+
+```{r echo=TRUE}
+ts_fret <- ts(data = df_fret[,2:29], start=c(2007,01,01),frequency=12)
+    # sur indice financier 
+library(robustbase)  # il faudra faire une boucle qui reconnait les variables qui sont des indices
+library(PerformanceAnalytics)
+df_clean1 <- Return.clean(ts_fret[,c(1,2,4,5,7,11,15,26,27,28)], method = "boudt")
+```
+
+
+
+### Sur les autres variables
+
+```{r}
+library(tsoutliers)
+
+df_clean2<-data.frame()
+
+a <- df_fret[,-c(1,2,3,5,6,8,12,16,27,28,29)]
+j<-0
+for (n in names(a)){
+  y<-ts(a[,c(as.character(n))])
+  fit<-tso(y)
+  i<-fit$yadj
+  if(j==0){df_clean2<-i} else{df_clean2<-data.frame(df_clean2,i)}
+  j<-j+1
+}
+names(df_clean2)<-names(a)
+str(df_clean2)
+```
+
+```{r echo=FALSE}
+df_clean2 <- as.data.frame(df_clean2)
+df_clean2$Crude.Oil.Prices..Brent. <- as.numeric(df_clean2$Crude.Oil.Prices..Brent.)
+df_clean2$Global.Economic.Policy <- as.numeric(df_clean2$Global.Economic.Policy)
+df_clean2$Geopolitical.Risk <- as.numeric(df_clean2$Geopolitical.Risk)
+df_clean2$world.trade..volume. <- as.numeric(df_clean2$world.trade..volume.)
+df_clean2$WTI <- as.numeric(df_clean2$WTI)
+df_clean2$Business_Tendency_Surveys<- as.numeric(df_clean2$Business_Tendency_Surveys)
+df_clean2$Capacity_Utilization<- as.numeric(df_clean2$Capacity_Utilization)
+df_clean2$Consumer_Sentiment<- as.numeric(df_clean2$Consumer_Sentiment)
+df_clean2$CPI<- as.numeric(df_clean2$CPI)
+df_clean2$GISS_Temperature<- as.numeric(df_clean2$GISS_Temperature)
+df_clean2$GEPU_current<- as.numeric(df_clean2$GEPU_current)
+df_clean2$GEPU_ppp<- as.numeric(df_clean2$GEPU_ppp)
+df_clean2$Indice_Kilian<- as.numeric(df_clean2$Indice_Kilian)
+df_clean2$Industrial_Production<- as.numeric(df_clean2$Industrial_Production)
+df_clean2$Industrial_Capacity<- as.numeric(df_clean2$Industrial_Capacity)
+df_clean2$M2<- as.numeric(df_clean2$M2)
+df_clean2$OECD_6NME_Industrial_Production<- as.numeric(df_clean2$OECD_6NME_Industrial_Production)
+df_clean2$Petroleum_and_other_liquids_stocks_US<- as.numeric(df_clean2$Petroleum_and_other_liquids_stocks_US)
+df_clean2$Spread<- as.numeric(df_clean2$Spread)
+df_clean2$Trade_Weighted_USD<- as.numeric(df_clean2$Trade_Weighted_USD)
+df_clean2$Taux_change_effectif_USD<- as.numeric(df_clean2$Taux_change_effectif_USD)
+df_clean2$US_Ending_Stocks_Crude_Oil<- as.numeric(df_clean2$US_Ending_Stocks_Crude_Oil)
+df_clean2$VIX<- as.numeric(df_clean2$VIX)
+
+# on rassemble les variables débarassées des outliers en un seul df
+df_clean1 <- as.data.frame(df_clean1)
+df_date <- df_fret %>% select(1)
+rownames(df_date) <- 1:nrow(df_date)
+df_date <- as.data.frame(df_date)
+df_clean <- cbind.data.frame(df_date,df_clean1,df_clean2)
+```
+
+Après ces rapides manipulations notre base est prète à l'emploi puisqu'elle est débarassée des outliers et les variables sont stationnarisées. Nous pouvons désormais nous pencher sur la visualisation des données pour les comprendre grâce à des graphiques, des statistiques et des classifications pour voir les liens entre les variables.
+
+## Graphiques des séries en niveau et les séries transformées
+
+Dans un premier temps nous regardons les graphiques des séries en niveau c'est à dire n'ayant subies aucune modification, en distinguant celles ayant été détectées non stationnaires par le test ADF des autres.
+
+```{r include=FALSE}
+library(rio)
+#df_fret_clean <- import("./Données/base_clean.xlsx" )
+df_fret_clean <- import("base_clean.xlsx" )
+str(df_fret_clean)
+
+df_fret <- read_excel("database project fret.xlsx")
+df_fret <- data.frame(df_fret)
+```
+
+### Graphiques des séries en niveau
+```{r echo=FALSE}
+# Variables non stationnaires selon le test ADF en rouge et en bleu celles stationnaires selon ADF
+dev.new()
+par(mfrow=c(4,4))
+plot(y=df_fret[,2], x=df_fret$Date, type="l", col="red", main="Évolution du cours BDI (variable brute)", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,4], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,5], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,6], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,7], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,8], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,9], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,12], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,13], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,14], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,15], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,16], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,17], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,18], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,19], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,20], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+
+dev.new()
+par(mfrow=c(4,3))
+plot(y=df_fret[,22], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,23], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,24], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,25], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,26], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,27], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+
+plot(y=df_fret[,3], x=df_fret$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,10], x=df_fret$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,11], x=df_fret$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,21], x=df_fret$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,28], x=df_fret$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,29], x=df_fret$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+```
+Comme noté précédement on voit à travers les graphiques des variables considérées comme stationnaires par le test de la racine unitaire, que des tendances sont largement observables : que ce soit une dépendance de la variance ou de la moyenne au temps. Il apparaît donc que le test statistique n'est pas fiable à 100% et il était plus prudent de stationnariser toutes les variables. Étant donné que la variable que nous expliquons est un cours boursier, les valeurs que nous avons obtenues en laguant la variable correspondent aux rentabilités de cet indice maritime. 
+
+### Graphiques des séries transformées
+
+```{r echo=FALSE}
+# séries propres donc stationnairées et libérées des outliers
+dev.new()
+par(mfrow=c(4,4))
+plot(y=df_fret_clean[,2], x=df_fret_clean$Date, type="l", col="blue", main="Évolution du cours BDI (variable stationarisée et standardisée)", ylab = "Cours", xlab='Temps')   #standardisée vraiment ? Je vois pas le code
+plot(y=df_fret_clean[,4], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,5], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,6], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,7], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,8], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,9], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,12], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,13], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,14], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,15], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,16], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,17], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,18], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,19], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,20], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+
+dev.new()
+par(mfrow=c(4,3))
+plot(y=df_fret_clean[,22], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,23], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,24], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,25], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,26], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,27], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,3], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,10], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,11], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,21], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,28], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,29], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+```
+
+
+
+## Statistiques descriptives des variables
+
+De nombreux packages sous R offrent des statistiques intéressantes et concrètes pour aider à comprendre les données. Nous confronterons les libraires **sumarytools**, **DataExplorer** et **explore** pour avoir l'analyse la plus complète possible. 
+
+```{r}
+library(summarytools)
+summarytools::descr(df_fret_clean, style = "rmarkdown")
+descr(df_fret_clean)
+```
+
+Grâce à la libraire **sumarytools** nous constatons que les rentabilités du Baltic Dry Index s'étendent de `min(df_fret_clean$Baltic.Dry.Index)` à `max(df_fret_clean$Baltic.Dry.Index)` avec une moyenne de `mean(df_fret_clean$Baltic.Dry.Index)` pour une médiane de `median(df_fret_clean$Baltic.Dry.Index)`. En comparaison avec l'étendue de la série (*i.e.* l'écart entre les valeurs maximales et minimales), la différence entre la moyenne et la médiane est minime puisqu'il est de `median(df_fret_clean$Baltic.Dry.Index)-mean(df_fret_clean$Baltic.Dry.Index)` et représente donc `(median(df_fret_clean$Baltic.Dry.Index)-mean(df_fret_clean$Baltic.Dry.Index))/(max(df_fret_clean$Baltic.Dry.Index)-min(df_fret_clean$Baltic.Dry.Index))*100`% de l'étendu global de la série. Ainsi la suppression des valeurs atypiques a-t-elle été efficace pour lisser les valeurs et ne pas altérer les calculs. 
+
+```{r}
+library(DataExplorer)
+DataExplorer::plot_missing(df_fret)
+naniar::gg_miss_var(df_fret, show_pct = TRUE)
+DataExplorer::plot_missing(df_fret_clean)
+naniar::gg_miss_var(df_fret_clean, show_pct = TRUE)
+```
+
+La libraire **DataExplorer** nous offre elle un aperçu des observations manquantes sur la base intiale puis sur celle manipulée pour laquelle il n'y en a plus. De même, nous observons les histogrammes de distribution des variables ci-dessous, nous constatons alors que les distribution s'apparentent davantage à des lois normales lorsque les données sont nettoyées. 
+
+```{r}
+view(DataExplorer::plot_histogram(df_fret))
+view(DataExplorer::plot_histogram(df_fret_clean))
+```
+
+
+```{r eval=FALSE, include=FALSE}
+library(explore)
+explore(df_fret_clean[,2:29])
+```
+
+
+## Classification (ACP, K-means …)
+
+Travail de Diane  ^^
+
+
+## Corrélation entre les variables explicative et la variable à expliquer, et entre les variables explicatives
+
+```{r}
+DataExplorer::plot_correlation(df_fret_clean)
+```
+
+Aussi, après avoir regarder différentes classifications pour comprendre les liens entre nos variables, nous regardons les coeffciients de corrélations que les lient entre elles. Nous voyons alors sur la matrice de corrélation que 
+
+Nous ne gardons pour la suite que les variables non corrélées entre elles, en considérant que la relation peut être génante pour les estimations, à partir du moment où elle excède 0.5. Nous écartons dès lors les variables
+
+
+
+
+
+
+------------------------------------------------------------------------------
+# Sélection des variables
+------------------------------------------------------------------------------
+
+```{r}
+          #Avant de commencer on centre et réduit nos variables
+
+y <- df_fret_clean %>%
+  select(Baltic.Dry.Index) %>%
+  scale(center = T, scale = F) %>%
+  as.matrix()
+
+x <- df_fret_clean %>%
+  select(-c(1,2)) %>%      # on retire la variable à expliquer y et date
+  as.matrix()
+```
+
+
+
+
+
+
+## Approche économétrique : GETS
+
+## Régressions pénalisées : Ridge, Lasso, Bridge, Elastic-Net, SCAD, Adaptive Lasso, Weighted fusion, adaptive EN, adaptive SCAD, MS-aEN et MS-aSCAD
+
+## Autre approche : décrire cette nouvelle méthode
+
+## Comparaison sous forme de tableau des variables sélectionnées par les différentes approches
+
+------------------------------------------------------------------------------
+# Modèle de régression
+------------------------------------------------------------------------------
+
+
+## Estimation par les MCO des modèles entre votre variable à expliquer, la variable endogène retardée (1 retard) et les variables sélectionnées. Commentez
+
+
+
+
+
+
+
+
+
+
+
+
+

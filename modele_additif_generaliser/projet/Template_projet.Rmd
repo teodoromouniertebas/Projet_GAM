@@ -1,0 +1,53 @@
+---
+title: "Project Template"
+author: "R. Nedellec"
+date: "11/25/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+Document R Markdown <http://rmarkdown.rstudio.com>.
+
+Plusieurs thèmes disponibles, cf [distill](https://rstudio.github.io/distill/) ou la [galerie](https://rmarkdown.rstudio.com/gallery.html)
+
+
+## Projet de prévision
+
+Nous pouvons charger les données directement dans le notebook, ainsi que les librairies nécessaires au projet.
+
+```{r, echo=FALSE, message=FALSE}
+library(mgcv)
+data_train <- read.csv("data/data_train.csv")
+```
+
+```{r, echo=FALSE}
+summary(data_train)
+```
+```{r}
+# convertissons la colonne START_TIME en colonne de Date
+data_train$START_TIME <- as.POSIXct(data_train$START_TIME, tz = "UTC", format = "%Y-%m-%d")
+summary(data_train)
+```
+
+
+Et réaliser l'apprentissage d'un modèle additif généralisé.
+
+```{r}
+gam <- gam(JOB_DURATION ~ START_TIME, family = gaussian(), data = data_train)
+summary(gam)
+```
+
+
+```{r}
+plot(JOB_DURATION~START_TIME, type = 'l', data = data_train)
+lines(x= data_train$START_TIME, y = gam$fitted.values, col = 'red')
+```
+## Il est aussi possible ..
+
+D'introduire des formules mathématiques $\lambda = \ldots$, des images, etc..
+
